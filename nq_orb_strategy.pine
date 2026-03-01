@@ -1,0 +1,218 @@
+// ============================================================================
+// NQ Nasdaq-100 Futures | ORB + VWAP + EMA Trend + Volume Breakout Strategy
+// Pine Script v5
+// ----------------------------------------------------------------------------
+// Logic:
+//   1. Build 15-min Opening Range (9:30–9:45 AM ET)
+//   2. VWAP bias: price above = long only, below = short only
+//   3. EMA stack: 9 > 21 > 55 = bull; 9 < 21 < 55 = bear
+//   4. Volume surge: bar volume > 1.5× 20-bar SMA
+//   5. Enter inside primary (9:45–11:00 AM) or secondary (2:30–3:30 PM) window
+//   6. ATR-based stop loss + take profit; EOD forced close at 3:45 PM
+// ============================================================================
+
+//@version=5
+strategy(
+     title              = "NQ ORB + VWAP + EMA + Volume Strategy",
+     shorttitle         = "NQ-ORB",
+     overlay            = true,
+     initial_capital    = 100000,
+     default_qty_type   = strategy.fixed,
+     default_qty_value  = 1,
+     commission_type    = strategy.commission.cash_per_contract,
+     commission_value   = 5,
+     slippage           = 2,
+     calc_on_every_tick = false)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+var string GRP_ORB = "Opening Range Breakout"
+orb_minutes = input.int(15, "ORB Duration (minutes)", minval=5, maxval=60, group=GRP_ORB,
+     tooltip="Minutes after 9:30 AM ET that define the opening range. Default = 15.")
+
+var string GRP_EMA = "EMA Trend Filter"
+ema_fast = input.int(9,  "Fast EMA",  minval=1, group=GRP_EMA)
+ema_mid  = input.int(21, "Mid EMA",   minval=1, group=GRP_EMA)
+ema_slow = input.int(55, "Slow EMA",  minval=1, group=GRP_EMA)
+
+var string GRP_VOL = "Volume Confirmation"
+vol_lookback   = input.int(20,    "Volume SMA Length",  minval=5,  group=GRP_VOL)
+vol_multiplier = input.float(1.5, "Volume Multiplier",  minval=1.0, step=0.1, group=GRP_VOL,
+     tooltip="Volume must exceed this multiple of the rolling SMA to confirm a breakout.")
+
+var string GRP_ATR = "ATR Risk Management"
+atr_length  = input.int(14,    "ATR Length",           minval=1,  group=GRP_ATR)
+atr_sl_mult = input.float(1.5, "Stop Loss ATR Mult",   minval=0.5, step=0.1, group=GRP_ATR)
+atr_tp_mult = input.float(3.0, "Take Profit ATR Mult", minval=0.5, step=0.1, group=GRP_ATR)
+
+var string GRP_SES = "Session Time Filter (ET)"
+primary_start_h   = input.int(9,  "Primary Start Hour",     minval=0, maxval=23, group=GRP_SES)
+primary_start_m   = input.int(45, "Primary Start Minute",   minval=0, maxval=59, group=GRP_SES)
+primary_end_h     = input.int(11, "Primary End Hour",       minval=0, maxval=23, group=GRP_SES)
+primary_end_m     = input.int(0,  "Primary End Minute",     minval=0, maxval=59, group=GRP_SES)
+use_secondary     = input.bool(true, "Enable Secondary Window (2:30–3:30 PM)", group=GRP_SES)
+secondary_start_h = input.int(14, "Secondary Start Hour",   minval=0, maxval=23, group=GRP_SES)
+secondary_start_m = input.int(30, "Secondary Start Minute", minval=0, maxval=59, group=GRP_SES)
+secondary_end_h   = input.int(15, "Secondary End Hour",     minval=0, maxval=23, group=GRP_SES)
+secondary_end_m   = input.int(30, "Secondary End Minute",   minval=0, maxval=59, group=GRP_SES)
+eod_close_h       = input.int(15, "EOD Close Hour",         minval=0, maxval=23, group=GRP_SES)
+eod_close_m       = input.int(45, "EOD Close Minute",       minval=0, maxval=59, group=GRP_SES)
+
+var string GRP_VIZ = "Visuals"
+show_orb_lines  = input.bool(true, "Show ORB High/Low Lines",   group=GRP_VIZ)
+show_ema_lines  = input.bool(true, "Show EMA Lines",            group=GRP_VIZ)
+show_vwap_line  = input.bool(true, "Show VWAP",                 group=GRP_VIZ)
+show_bg_windows = input.bool(true, "Highlight Trading Windows", group=GRP_VIZ)
+show_signals    = input.bool(true, "Show Entry Signals",        group=GRP_VIZ)
+
+// ============================================================================
+// TIMEZONE-SAFE TIME HELPERS
+// ============================================================================
+// timestamp() with IANA timezone handles US DST automatically (Mar/Nov shifts)
+
+f_et_ts(h, m) =>
+    timestamp("America/New_York", year, month, dayofmonth, h, m, 0)
+
+bar_time = time  // bar open time in ms (built-in)
+
+// ============================================================================
+// DAILY ORB CONSTRUCTION
+// ============================================================================
+
+orb_start_ts = f_et_ts(9, 30)
+orb_end_ts   = f_et_ts(9, 30 + orb_minutes)  // e.g. 9:45 ET for 15-min ORB
+
+var int   prev_dom  = na
+var float orbHigh   = na
+var float orbLow    = na
+var bool  orbFormed = false
+
+is_new_day = (dayofmonth != prev_dom)
+
+if is_new_day
+    orbHigh   := na
+    orbLow    := na
+    orbFormed := false
+    prev_dom  := dayofmonth
+
+in_orb_window = (bar_time >= orb_start_ts) and (bar_time < orb_end_ts)
+
+if in_orb_window
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow  := na(orbLow)  ? low  : math.min(orbLow,  low)
+
+// Mark ORB as formed once the window has passed and we have valid levels
+if (bar_time >= orb_end_ts) and not orbFormed and not na(orbHigh)
+    orbFormed := true
+
+// ============================================================================
+// INDICATORS
+// ============================================================================
+
+ema9  = ta.ema(close, ema_fast)
+ema21 = ta.ema(close, ema_mid)
+ema55 = ta.ema(close, ema_slow)
+
+// Trend alignment: all three EMAs must be in sequence
+bull_ema = ema9 > ema21 and ema21 > ema55
+bear_ema = ema9 < ema21 and ema21 < ema55
+
+vwap_val    = ta.vwap(hlc3)           // resets each session automatically in v5
+vol_sma     = ta.sma(volume, vol_lookback)
+vol_surging = volume > (vol_sma * vol_multiplier)
+atr_val     = ta.atr(atr_length)
+
+// ============================================================================
+// SESSION WINDOW LOGIC
+// ============================================================================
+
+primary_start_ts   = f_et_ts(primary_start_h, primary_start_m)
+primary_end_ts     = f_et_ts(primary_end_h,   primary_end_m)
+secondary_start_ts = f_et_ts(secondary_start_h, secondary_start_m)
+secondary_end_ts   = f_et_ts(secondary_end_h,   secondary_end_m)
+eod_close_ts       = f_et_ts(eod_close_h, eod_close_m)
+
+in_primary_window   = (bar_time >= primary_start_ts) and (bar_time < primary_end_ts)
+in_secondary_window = use_secondary and
+                      (bar_time >= secondary_start_ts) and (bar_time < secondary_end_ts)
+in_entry_window     = in_primary_window or in_secondary_window
+past_eod            = (bar_time >= eod_close_ts)
+
+// ============================================================================
+// ENTRY CONDITIONS
+// ============================================================================
+
+no_position = strategy.position_size == 0
+
+// ta.crossover fires exactly once on the bar where close crosses above orbHigh
+long_condition = orbFormed          and
+                 ta.crossover(close, orbHigh) and
+                 no_position        and
+                 in_entry_window    and
+                 bull_ema           and
+                 close > vwap_val   and
+                 vol_surging
+
+short_condition = orbFormed          and
+                  ta.crossunder(close, orbLow) and
+                  no_position        and
+                  in_entry_window    and
+                  bear_ema           and
+                  close < vwap_val   and
+                  vol_surging
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+
+if long_condition
+    sl_long = close - (atr_sl_mult * atr_val)
+    tp_long = close + (atr_tp_mult * atr_val)
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", from_entry="Long", stop=sl_long, limit=tp_long)
+
+if short_condition
+    sl_short = close + (atr_sl_mult * atr_val)
+    tp_short = close - (atr_tp_mult * atr_val)
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", from_entry="Short", stop=sl_short, limit=tp_short)
+
+// EOD forced close — flatten all positions before market close
+if past_eod and strategy.position_size != 0
+    strategy.close_all(comment="EOD Close")
+
+// ============================================================================
+// VISUALS
+// ============================================================================
+
+// Show ORB levels during and after the ORB window (until EOD)
+orb_high_plot = (orbFormed or in_orb_window) ? orbHigh : na
+orb_low_plot  = (orbFormed or in_orb_window) ? orbLow  : na
+
+plot(show_orb_lines ? orb_high_plot : na,
+     title="ORB High", color=color.new(color.green, 0), linewidth=2, style=plot.style_line)
+plot(show_orb_lines ? orb_low_plot  : na,
+     title="ORB Low",  color=color.new(color.red,   0), linewidth=2, style=plot.style_line)
+
+plot(show_ema_lines ? ema9  : na, title="EMA 9",  color=color.new(color.yellow, 0), linewidth=1)
+plot(show_ema_lines ? ema21 : na, title="EMA 21", color=color.new(color.orange, 0), linewidth=1)
+plot(show_ema_lines ? ema55 : na, title="EMA 55", color=color.new(color.purple, 0), linewidth=2)
+
+plot(show_vwap_line ? vwap_val : na, title="VWAP", color=color.new(color.blue, 0), linewidth=2)
+
+// Highlight trade windows with subtle background shading
+bgcolor(show_bg_windows and in_primary_window   ? color.new(color.green,  92) : na, title="Primary Window")
+bgcolor(show_bg_windows and in_secondary_window ? color.new(color.yellow, 92) : na, title="Secondary Window")
+
+// Entry signal markers
+plotshape(show_signals and long_condition,
+     title="Long Signal", style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.lime, 0),
+     size=size.small, text="L")
+
+plotshape(show_signals and short_condition,
+     title="Short Signal", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.red, 0),
+     size=size.small, text="S")
