@@ -1,0 +1,277 @@
+// ============================================================================
+// NQ Nasdaq-100 Futures | ORB Strategy v2
+// Pine Script v5
+// ----------------------------------------------------------------------------
+// v2 Changes vs v1:
+//   - EMA filter LOOSENED: was strict 9>21>55 stack, now just close > EMA55
+//     (removed requirement that fast and mid EMAs be aligned too)
+//   - Volume threshold LOWERED: 1.5x → 1.2x (more trades pass filter)
+//   - ATR Stop TIGHTENED: 1.5x → 1.0x (smaller per-trade loss on false BOs)
+//   - ATR TP LOWERED: 3.0x → 2.0x (easier to reach = higher win rate)
+//   - BREAKEVEN STOP ADDED: after 1x ATR move in our favor, stop moves
+//     to entry price (prevents big winners from becoming losers, e.g. Trade #2
+//     which had $5065 unrealized profit before reversing to a $2750 loss)
+//   - RSI FILTER ADDED: avoid overbought longs (RSI > 70) and oversold
+//     shorts (RSI < 30) — reduces false breakout entries at extremes
+//   - LONG-ONLY MODE: optional toggle to disable short trades
+// ============================================================================
+
+//@version=5
+strategy(
+     title              = "NQ ORB + VWAP + EMA + Volume Strategy v2",
+     shorttitle         = "NQ-ORB-v2",
+     overlay            = true,
+     initial_capital    = 100000,
+     default_qty_type   = strategy.fixed,
+     default_qty_value  = 1,
+     commission_type    = strategy.commission.cash_per_contract,
+     commission_value   = 5,
+     slippage           = 2,
+     calc_on_every_tick = false)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+var string GRP_ORB = "Opening Range Breakout"
+orb_minutes = input.int(15, "ORB Duration (minutes)", minval=5, maxval=60, group=GRP_ORB,
+     tooltip="Minutes after 9:30 AM ET defining the opening range. Default = 15.")
+
+var string GRP_EMA = "EMA Trend Filter"
+ema_slow = input.int(55, "Trend EMA (Slow)",  minval=1, group=GRP_EMA,
+     tooltip="v2: Only uses this single EMA as trend filter. Long if close > this EMA, Short if below.")
+
+var string GRP_RSI = "RSI Filter"
+rsi_length   = input.int(14,  "RSI Length", minval=2, group=GRP_RSI)
+rsi_ob       = input.int(70,  "Overbought Threshold (avoid longs above)", minval=50, maxval=90, group=GRP_RSI)
+rsi_os       = input.int(30,  "Oversold Threshold (avoid shorts below)",  minval=10, maxval=50, group=GRP_RSI)
+
+var string GRP_VOL = "Volume Confirmation"
+vol_lookback   = input.int(20,   "Volume SMA Length",   minval=5,   group=GRP_VOL)
+vol_multiplier = input.float(1.2, "Volume Multiplier",  minval=1.0, step=0.1, group=GRP_VOL,
+     tooltip="v2: Lowered from 1.5x to 1.2x to allow more valid breakout trades.")
+
+var string GRP_ATR = "ATR Risk Management"
+atr_length  = input.int(14,   "ATR Length",               minval=1,  group=GRP_ATR)
+atr_sl_mult = input.float(1.0, "Stop Loss ATR Mult",      minval=0.5, step=0.1, group=GRP_ATR,
+     tooltip="v2: Tightened from 1.5x to 1.0x. Smaller loss per false breakout.")
+atr_tp_mult = input.float(2.0, "Take Profit ATR Mult",   minval=0.5, step=0.1, group=GRP_ATR,
+     tooltip="v2: Reduced from 3.0x to 2.0x. More trades reach TP = higher win rate.")
+use_be_stop = input.bool(true, "Enable Breakeven Stop",  group=GRP_ATR,
+     tooltip="After 1x ATR move in our favor, stop moves to entry price. Prevents winners from becoming losers.")
+be_trigger_mult = input.float(1.0, "Breakeven Trigger (ATR Mult)", minval=0.25, step=0.25, group=GRP_ATR,
+     tooltip="How far price must move in our favor (in ATR multiples) before stop moves to entry.")
+
+var string GRP_SES = "Session Time Filter (ET)"
+primary_start_h   = input.int(9,  "Primary Start Hour",     minval=0, maxval=23, group=GRP_SES)
+primary_start_m   = input.int(45, "Primary Start Minute",   minval=0, maxval=59, group=GRP_SES)
+primary_end_h     = input.int(11, "Primary End Hour",       minval=0, maxval=23, group=GRP_SES)
+primary_end_m     = input.int(0,  "Primary End Minute",     minval=0, maxval=59, group=GRP_SES)
+use_secondary     = input.bool(true, "Enable Secondary Window (2:30–3:30 PM)", group=GRP_SES)
+secondary_start_h = input.int(14, "Secondary Start Hour",   minval=0, maxval=23, group=GRP_SES)
+secondary_start_m = input.int(30, "Secondary Start Minute", minval=0, maxval=59, group=GRP_SES)
+secondary_end_h   = input.int(15, "Secondary End Hour",     minval=0, maxval=23, group=GRP_SES)
+secondary_end_m   = input.int(30, "Secondary End Minute",   minval=0, maxval=59, group=GRP_SES)
+eod_close_h       = input.int(15, "EOD Close Hour",         minval=0, maxval=23, group=GRP_SES)
+eod_close_m       = input.int(45, "EOD Close Minute",       minval=0, maxval=59, group=GRP_SES)
+
+var string GRP_FILTER = "Additional Filters"
+long_only = input.bool(false, "Long-Only Mode (disable short trades)", group=GRP_FILTER,
+     tooltip="Toggle on to trade long entries only. Useful in confirmed bull markets.")
+
+var string GRP_VIZ = "Visuals"
+show_orb_lines  = input.bool(true, "Show ORB High/Low Lines",   group=GRP_VIZ)
+show_ema_line   = input.bool(true, "Show Trend EMA",            group=GRP_VIZ)
+show_vwap_line  = input.bool(true, "Show VWAP",                 group=GRP_VIZ)
+show_bg_windows = input.bool(true, "Highlight Trading Windows", group=GRP_VIZ)
+show_signals    = input.bool(true, "Show Entry Signals",        group=GRP_VIZ)
+
+// ============================================================================
+// TIMEZONE-SAFE TIME HELPERS
+// ============================================================================
+
+f_et_ts(h, m) =>
+    timestamp("America/New_York", year, month, dayofmonth, h, m, 0)
+
+bar_time = time
+
+// ============================================================================
+// DAILY ORB CONSTRUCTION
+// ============================================================================
+
+orb_start_ts = f_et_ts(9, 30)
+orb_end_ts   = f_et_ts(9, 30 + orb_minutes)
+
+var int   prev_dom  = na
+var float orbHigh   = na
+var float orbLow    = na
+var bool  orbFormed = false
+
+is_new_day = (dayofmonth != prev_dom)
+
+if is_new_day
+    orbHigh   := na
+    orbLow    := na
+    orbFormed := false
+    prev_dom  := dayofmonth
+
+in_orb_window = (bar_time >= orb_start_ts) and (bar_time < orb_end_ts)
+
+if in_orb_window
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow  := na(orbLow)  ? low  : math.min(orbLow,  low)
+
+if (bar_time >= orb_end_ts) and not orbFormed and not na(orbHigh)
+    orbFormed := true
+
+// ============================================================================
+// INDICATORS
+// ============================================================================
+
+ema55_val  = ta.ema(close, ema_slow)
+rsi_val    = ta.rsi(close, rsi_length)
+vwap_val   = ta.vwap(hlc3)
+vol_sma    = ta.sma(volume, vol_lookback)
+atr_val    = ta.atr(atr_length)
+
+// v2 SIMPLIFIED TREND FILTER: just price vs trend EMA (no strict stack alignment)
+bull_trend = close > ema55_val
+bear_trend = close < ema55_val
+
+// ============================================================================
+// SESSION WINDOW LOGIC
+// ============================================================================
+
+primary_start_ts   = f_et_ts(primary_start_h, primary_start_m)
+primary_end_ts     = f_et_ts(primary_end_h,   primary_end_m)
+secondary_start_ts = f_et_ts(secondary_start_h, secondary_start_m)
+secondary_end_ts   = f_et_ts(secondary_end_h,   secondary_end_m)
+eod_close_ts       = f_et_ts(eod_close_h, eod_close_m)
+
+in_primary_window   = (bar_time >= primary_start_ts) and (bar_time < primary_end_ts)
+in_secondary_window = use_secondary and
+                      (bar_time >= secondary_start_ts) and (bar_time < secondary_end_ts)
+in_entry_window     = in_primary_window or in_secondary_window
+past_eod            = (bar_time >= eod_close_ts)
+
+// ============================================================================
+// ENTRY CONDITIONS
+// ============================================================================
+
+no_position  = strategy.position_size == 0
+vol_surging  = volume > (vol_sma * vol_multiplier)
+
+long_condition = orbFormed           and
+                 ta.crossover(close, orbHigh) and
+                 no_position         and
+                 in_entry_window     and
+                 bull_trend          and        // v2: simplified — close > EMA55
+                 close > vwap_val    and
+                 rsi_val < rsi_ob    and        // v2: avoid overbought entries
+                 vol_surging
+
+short_condition = orbFormed           and
+                  ta.crossunder(close, orbLow) and
+                  no_position         and
+                  in_entry_window     and
+                  bear_trend          and        // v2: simplified — close < EMA55
+                  close < vwap_val    and
+                  rsi_val > rsi_os    and        // v2: avoid oversold entries
+                  vol_surging         and
+                  not long_only                  // v2: respect long-only mode
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+
+// Track entry info for breakeven stop management
+var float entry_price_long  = na
+var float entry_price_short = na
+var float tp_price_long     = na
+var float tp_price_short    = na
+var bool  be_done_long      = false  // breakeven already activated this trade
+var bool  be_done_short     = false
+
+if long_condition
+    sl_long      = close - (atr_sl_mult * atr_val)
+    tp_long      = close + (atr_tp_mult * atr_val)
+    entry_price_long := close
+    tp_price_long    := tp_long
+    be_done_long     := false
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", from_entry="Long", stop=sl_long, limit=tp_long)
+
+if short_condition
+    sl_short      = close + (atr_sl_mult * atr_val)
+    tp_short      = close - (atr_tp_mult * atr_val)
+    entry_price_short := close
+    tp_price_short    := tp_short
+    be_done_short     := false
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", from_entry="Short", stop=sl_short, limit=tp_short)
+
+// ============================================================================
+// BREAKEVEN STOP MANAGEMENT (v2 KEY ADDITION)
+// ============================================================================
+// After price moves be_trigger_mult × ATR in our favor, move the stop to the
+// entry price. This prevents a trade that was profitable from turning into a
+// full loss (e.g. v1 Trade #2: $5065 unrealized → -$2750 final loss).
+
+if use_be_stop
+    // Long breakeven
+    if strategy.position_size > 0 and not be_done_long and not na(entry_price_long)
+        be_trigger_level = entry_price_long + be_trigger_mult * atr_val
+        if close >= be_trigger_level
+            // Update exit: stop moves to entry, keep original TP
+            strategy.exit("Long Exit", from_entry="Long",
+                 stop  = entry_price_long,
+                 limit = tp_price_long)
+            be_done_long := true
+
+    // Short breakeven
+    if strategy.position_size < 0 and not be_done_short and not na(entry_price_short)
+        be_trigger_level = entry_price_short - be_trigger_mult * atr_val
+        if close <= be_trigger_level
+            strategy.exit("Short Exit", from_entry="Short",
+                 stop  = entry_price_short,
+                 limit = tp_price_short)
+            be_done_short := true
+
+// EOD forced close
+if past_eod and strategy.position_size != 0
+    strategy.close_all(comment="EOD Close")
+
+// Reset entry tracking when flat
+if strategy.position_size == 0
+    entry_price_long  := na
+    entry_price_short := na
+    tp_price_long     := na
+    tp_price_short    := na
+
+// ============================================================================
+// VISUALS
+// ============================================================================
+
+orb_high_plot = (orbFormed or in_orb_window) ? orbHigh : na
+orb_low_plot  = (orbFormed or in_orb_window) ? orbLow  : na
+
+plot(show_orb_lines ? orb_high_plot : na,
+     title="ORB High", color=color.new(color.green, 0), linewidth=2, style=plot.style_line)
+plot(show_orb_lines ? orb_low_plot  : na,
+     title="ORB Low",  color=color.new(color.red,   0), linewidth=2, style=plot.style_line)
+
+plot(show_ema_line  ? ema55_val : na, title="EMA 55 (Trend)", color=color.new(color.purple, 0), linewidth=2)
+plot(show_vwap_line ? vwap_val  : na, title="VWAP",           color=color.new(color.blue,   0), linewidth=2)
+
+bgcolor(show_bg_windows and in_primary_window   ? color.new(color.green,  92) : na, title="Primary Window")
+bgcolor(show_bg_windows and in_secondary_window ? color.new(color.yellow, 92) : na, title="Secondary Window")
+
+plotshape(show_signals and long_condition,
+     title="Long Signal",  style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.lime, 0),
+     size=size.small, text="L")
+
+plotshape(show_signals and short_condition,
+     title="Short Signal", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.red, 0),
+     size=size.small, text="S")
